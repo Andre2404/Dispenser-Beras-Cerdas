@@ -1,0 +1,585 @@
+#include <Keypad.h>
+#include <Wire.h>
+#include <LiquidCrystal_PCF8574.h>
+#include <ESP32Servo.h>
+#include <HX711_ADC.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+#include <WiFi.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+
+// Inisialisasi LCD (ubah alamat I2C jika perlu)
+LiquidCrystal_PCF8574 lcd(0x27);
+
+// Pin untuk komponen pada ESP32
+#define IR_SENSOR_PIN 34 // Sensor IR
+#define LED_PIN 13       // Lampu indikator sensor
+#define HX711_dout 25    // Pin Data Load Cell
+#define HX711_sck 26     // Pin Clock Load Cell
+#define SERVO_PIN 2     // Pin untuk motor servo
+
+// Inisialisasi Keypad
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+byte rowPins[ROWS] = {19, 18, 5, 17};
+byte colPins[COLS] = {16, 4, 15, 32};
+Keypad customKeypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// Inisialisasi Load Cell
+HX711_ADC LoadCell(HX711_dout, HX711_sck);
+
+// Servo
+Servo servo;
+
+// Variabel global
+bool irState = false;
+float currentWeight = 0.0;
+float targetWeight = 0.0;
+bool isTareSet = false;
+char inputBuffer[10] = "";
+int inputIndex = 0;
+bool inputMode = true;
+
+// Wi-Fi credentials
+const char* ssid = "Mabes";
+const char* password = "sukasukagw";
+
+// Server web
+AsyncWebServer server(80);
+WebSocketsServer webSocket(81);
+
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Timbangan Otomatis</title>
+  <style>
+    body {
+      font-family: 'Roboto', sans-serif;
+      background-color: #f5f5f5;
+      margin: 0;
+      padding: 0;
+      color: #333;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    .container {
+      max-width: 600px;
+      width: 90%;
+      background-color: #ffffff;
+      border-radius: 10px;
+      box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+      padding: 20px;
+      text-align: center;
+    }
+    .status {
+      font-size: 20px;
+      color: #d32f2f;
+      margin-bottom: 10px;
+    }
+    .hidden {
+      display: none;
+    }
+    .gauge, .weight, form {
+      margin-top: 20px;
+    }
+    .gauge {
+      position: relative;
+      margin: 20px auto;
+      width: 150px;
+      height: 150px;
+      border: 10px solid #e0e0e0;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .needle {
+      position: absolute;
+      width: 4px;
+      height: 70px;
+      background-color: #f44336;
+      transform-origin: bottom center;
+      transform: rotate(0deg);
+    }
+    .weight {
+      font-size: 24px;
+      margin-top: 15px;
+      font-weight: bold;
+      color: #4caf50;
+    }
+    form, button {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+    input[type="text"], input[type="submit"], button {
+      width: 80%;
+      max-width: 250px;
+      padding: 10px;
+      font-size: 16px;
+      border-radius: 5px;
+      border: 1px solid #ccc;
+      outline: none;
+      transition: all 0.3s ease;
+    }
+    input[type="text"]:focus {
+      border-color: #4caf50;
+      box-shadow: 0 0 5px rgba(76, 175, 80, 0.5);
+    }
+    input[type="submit"], button {
+      background-color: #4caf50;
+      color: #fff;
+      border: none;
+      cursor: pointer;
+    }
+    input[type="submit"]:hover, button:hover {
+      background-color: #45a049;
+    }
+    button {
+  margin: 10px auto;
+  margin-top: 20px;
+      }
+    footer {
+      margin-top: 20px;
+      font-size: 12px;
+      color: #999;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Timbangan Otomatis</h1>
+    <div id="statusMessage" class="status hidden">Silakan masukkan wadah untuk mulai menimbang!</div>
+    <div id="weighingSection" class="hidden">
+      <div class="gauge">
+        <div class="needle" id="needle"></div>
+      </div>
+      <div class="weight" id="weight">Weight: 0.00 g</div>
+    </div>
+    <form id="inputForm">
+      <input type="text" name="targetWeight" id="targetWeight" placeholder="Enter target weight (g)" required>
+      <input type="submit" value="Set Target">
+    </form>
+  </div>
+  <footer>© 2024 Timbangan Otomatis. All Rights Reserved.</footer>
+<script>
+    const socket = new WebSocket('ws://' + window.location.hostname + ':81/');
+
+    let isWeighing = false;
+
+    socket.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+
+        if (data.irDetected === false) {
+            document.getElementById('statusMessage').classList.remove('hidden');
+            document.getElementById('weighingSection').classList.add('hidden');
+        } else {
+            document.getElementById('statusMessage').classList.add('hidden');
+            document.getElementById('weighingSection').classList.remove('hidden');
+            document.getElementById('weight').innerText = 'Weight: ' + data.weight + ' g';
+            document.getElementById('distance').innerText = 'Distance: ' + data.distance + ' cm';
+            const needle = document.getElementById('needle');
+            needle.style.transform = 'rotate(' + (data.servoAngle - 90) + 'deg)';
+        }
+
+        if (data.isWeighingComplete && isWeighing) {
+            isWeighing = false;
+            alert('Proses penimbangan selesai!');
+            document.getElementById('inputForm').classList.remove('hidden');
+        }
+    };
+
+    document.getElementById('inputForm').addEventListener('submit', function(event) {
+        event.preventDefault();
+        const targetWeight = document.getElementById('targetWeight').value;
+        socket.send(JSON.stringify({ action: 'setTarget', targetWeight: targetWeight }));
+        document.getElementById('inputForm').classList.add('hidden');
+        isWeighing = true;
+    });
+
+    socket.onopen = function(event) {
+        console.log('WebSocket connection opened');
+    };
+
+    socket.onclose = function(event) {
+        console.log('WebSocket connection closed');
+    };
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(IR_SENSOR_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+  servo.attach(SERVO_PIN);
+
+  lcd.begin(20, 4); // Sesuaikan dengan jumlah kolom dan baris LCD
+  lcd.setBacklight(255); // Atur intensitas backlight maksimum (0-255)
+  lcd.clear();
+
+  LoadCell.begin();
+  LoadCell.start(500);  // Waktu inisialisasi lebih singkat
+  LoadCell.setCalFactor(955.123);
+  LoadCell.setSamplesInUse(4); // Mengurangi jumlah sampel untuk pembacaan lebih cepat
+
+  servo.write(0);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Timbangan Otomatis");
+  delay(1000);
+  lcd.clear();
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+  Serial.println(WiFi.localIP());
+
+  // Route for root / web page
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", INDEX_HTML);
+  });
+
+  // Route to handle POST request for setting target weight
+  server.on("/setTarget", HTTP_POST, [](AsyncWebServerRequest *request){
+    int params = request->params();
+    for(int i=0;i<params;i++){
+      AsyncWebParameter* p = request->getParam(i);
+      if(p->isPost()){
+        if (p->name() == "targetWeight") {
+          targetWeight = p->value().toFloat();
+          isTareSet = false;
+          inputMode = false;
+          request->send(200, "text/plain", "Target weight set to " + String(targetWeight) + " g");
+        }
+      }
+    }
+  });
+
+  // Start server
+  server.begin();
+
+  // Start WebSocket server
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+}
+void loop() {
+  irState = digitalRead(IR_SENSOR_PIN);
+
+  // Kirim status deteksi ke WebSocket
+  String data = "{\"irDetected\": " + String(irState == LOW ? "true" : "false") +
+                ", \"weight\": " + String(currentWeight, 2) +
+                ", \"servoAngle\": " + String(servo.read()) +
+                ", \"isWeighingComplete\": " + String(targetWeight == 0 ? "true" : "false") + "}";
+  webSocket.broadcastTXT(data.c_str());
+
+  if (irState == LOW) {
+    // Objek terdeteksi
+    digitalWrite(LED_PIN, LOW);
+    lcd.setCursor(0, 0);
+    lcd.print("Object Detected   ");
+
+    // Membaca data berat
+    if (LoadCell.update()) {
+      currentWeight = LoadCell.getData();
+    }
+
+    if (currentWeight < 0) {
+      currentWeight = 0.0;
+    }
+
+    // Tampilkan berat dan target pada LCD
+    lcd.setCursor(0, 1);
+    lcd.print("Weight: ");
+    lcd.print(currentWeight, 2);
+    lcd.print(" g");
+
+    lcd.setCursor(0, 2);
+    lcd.print("Target: ");
+    lcd.print(targetWeight, 2);
+    lcd.print(" g");
+
+    // Mode input untuk memasukkan target berat
+    if (inputMode) {
+      lcd.setCursor(0, 3);
+      lcd.print("Input: ");
+      lcd.print(inputBuffer);
+      handleKeypadInput();
+    }
+
+    // Melakukan tare hanya jika belum disetel
+    if (targetWeight > 0 && !isTareSet) {
+      performTare();
+    }
+
+    // Mulai proses penimbangan jika tare sudah selesai
+    if (targetWeight > 0 && isTareSet) {
+      startWeighingProcess();
+    }
+  } else {
+    // Objek tidak terdeteksi
+    digitalWrite(LED_PIN, HIGH);
+    lcd.setCursor(0, 0);
+    lcd.print("Object Undetected ");
+    lcd.setCursor(0, 1);
+    lcd.print("                  ");
+    lcd.setCursor(0, 2);
+    lcd.print("                  ");
+    lcd.setCursor(0, 3);
+    lcd.print("                  ");
+
+    // Hapus Reset Otomatis: Jangan reset targetWeight atau isTareSet di sini
+    if (currentWeight < 2.0 && targetWeight > 0) {
+      // Tutup servo jika berat sangat kecil
+      servo.write(0);
+    }
+
+    // Hanya Aktifkan Mode Input: Izinkan pengaturan ulang target secara manual
+    if (targetWeight == 0) {
+      inputMode = true;
+    }
+  }
+
+  // Loop WebSocket
+  webSocket.loop();
+}
+
+
+void performTare() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Taring...");
+  lcd.setCursor(0, 1);
+  lcd.print("Before Tare: ");
+  lcd.print(currentWeight, 2);
+  lcd.print(" g");
+
+  LoadCell.tareNoDelay(); // Melakukan tare dengan metode non-blocking
+  while (!LoadCell.update()) {
+    // Menunggu proses tare selesai
+  }
+
+  currentWeight = LoadCell.getData();
+
+  if (currentWeight < 0) {
+    currentWeight = 0.0;
+  }
+
+  lcd.setCursor(0, 2);
+  lcd.print("After Tare: ");
+  lcd.print(currentWeight, 2);
+  lcd.print(" g");
+
+  isTareSet = true;
+  lcd.clear();
+}
+
+void handleKeypadInput() { 
+  char key = customKeypad.getKey();
+
+  if (key) {
+    if (key >= '0' && key <= '9') {
+      if (inputIndex < sizeof(inputBuffer) - 1) {
+        inputBuffer[inputIndex++] = key;
+        inputBuffer[inputIndex] = '\0';
+      }
+    } else if (key == '#') {
+      if (inputIndex > 0) {
+        targetWeight = atof(inputBuffer);
+        lcd.setCursor(0, 3);
+        lcd.print("Target Set: ");
+        lcd.print(targetWeight, 2);
+        lcd.print(" g  ");
+        memset(inputBuffer, 0, sizeof(inputBuffer));
+        inputIndex = 0;
+        inputMode = false;
+        lcd.clear();
+        performTare();
+      }
+    } else if (key == 'C') {
+      memset(inputBuffer, 0, sizeof(inputBuffer));
+      inputIndex = 0;
+      lcd.setCursor(0, 3);
+      lcd.print("Input Cleared    ");
+      lcd.clear();
+    } else if (key == 'B') {
+      LoadCell.tareNoDelay(); // Melakukan tare dengan metode non-blocking
+      while (!LoadCell.update()) {
+        // Menunggu proses tare selesai
+      }
+
+      currentWeight = LoadCell.getData(); // Ambil berat setelah tare
+      if (currentWeight < 0) {
+        currentWeight = 0.0; // Pastikan berat tidak negatif
+      }
+
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Tare Complete");
+      lcd.setCursor(0, 1);
+      lcd.print("Weight: ");
+      lcd.print(currentWeight, 2);
+      lcd.print(" g");
+    }
+  }
+}
+
+void startWeighingProcess() {
+  lcd.setCursor(0, 0);
+  lcd.print("Weighing...");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Target: ");
+  lcd.print(targetWeight, 2);
+  lcd.print(" g");
+
+  // Tunggu hingga berat 0 sebelum memulai penimbangan
+  while (currentWeight > 0.1) {
+    if (LoadCell.update()) {
+      currentWeight = LoadCell.getData();
+    }
+
+    if (currentWeight < 0) {
+      currentWeight = 0.0;
+    }
+
+    lcd.setCursor(0, 2);
+    lcd.print("Taring...");
+    lcd.setCursor(0, 3);
+    lcd.print("Weight: ");
+    lcd.print(currentWeight, 2);
+    lcd.print(" g   ");
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Tare Complete");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...    ");
+  delay(1000);
+  lcd.clear();
+
+  int initialAngle = (targetWeight > 50) ? 90 : 45;
+  servo.write(initialAngle); // Bukaan awal servo
+
+  while (currentWeight < targetWeight) {
+    if (LoadCell.update()) {
+      currentWeight = LoadCell.getData();
+    }
+
+    if (currentWeight < 0) {
+      currentWeight = 0.0;
+    }
+
+    float progress = currentWeight / targetWeight;
+    if (progress > 1.0) {
+      progress = 1.0;
+    }
+
+    int servoAngle;
+    if (currentWeight < targetWeight * 0.5) {
+      servoAngle = initialAngle; // Servo tetap terbuka penuh jika berat masih di bawah 50% target
+    } else if (currentWeight < targetWeight) {
+      servoAngle = initialAngle / 2; // Servo setengah tertutup jika berat antara 50% - 100% target
+    } else {
+      servoAngle = 0; // Servo sepenuhnya tertutup jika berat telah mencapai atau melampaui target
+    }
+
+    if (abs(currentWeight - targetWeight) <= 9.0) {
+  servoAngle = 0; // Servo menutup jika berat dalam toleransi ±11g
+    }
+
+    servo.write(servoAngle);
+
+    lcd.setCursor(0, 2);
+    lcd.print("Weight: ");
+    lcd.print(currentWeight, 2);
+    lcd.print(" g   ");
+
+    lcd.setCursor(0, 3);
+    lcd.print("Servo: ");
+    lcd.print(servoAngle);
+    lcd.print(" deg ");
+
+    // Send data to WebSocket
+    String data = "{\"weight\": " + String(currentWeight, 2) + ", \"servoAngle\": " + String(servoAngle) + "}";
+    webSocket.broadcastTXT(data.c_str());
+  }
+
+  servo.write(0);
+  lcd.setCursor(0, 3);
+  lcd.print("Target Reached!");
+
+  lcd.clear();
+  targetWeight = 0;
+  isTareSet = false;
+  inputMode = true;
+}
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[%u] Disconnected!\n", num);
+      break;
+
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      Serial.printf("[%u] Connected from %d.%d.%d.%d url: %s\n", num, ip[0], ip[1], ip[2], ip[3], payload);
+      webSocket.sendTXT(num, "Connected");
+      break;
+    }
+
+    case WStype_TEXT: {
+      Serial.printf("[%u] get Text: %s\n", num, payload);
+
+      // Memproses pesan JSON menggunakan ArduinoJson
+      DynamicJsonDocument doc(256); // Alokasi memori untuk JSON
+      DeserializationError error = deserializeJson(doc, payload);
+      if (error) {
+        Serial.printf("Failed to parse JSON: %s\n", error.c_str());
+        return; // Keluar jika JSON tidak valid
+      }
+
+      // Mendapatkan nilai "action" dari JSON
+      const char* action = doc["action"];
+      if (strcmp(action, "setTarget") == 0) {
+        // Mengatur target berat dari JSON
+        targetWeight = doc["targetWeight"].as<float>();
+        isTareSet = false; // Atur ulang tare
+        inputMode = false; // Nonaktifkan mode input
+        Serial.printf("Target weight set to: %.2f g\n", targetWeight);
+      }
+      break;
+    }
+
+    case WStype_BIN:
+      Serial.printf("[%u] get binary length: %u\n", num, length);
+      break;
+
+    // Tambahan case untuk jenis data lainnya
+    case WStype_ERROR:
+    case WStype_FRAGMENT_TEXT_START:
+    case WStype_FRAGMENT_BIN_START:
+    case WStype_FRAGMENT:
+    case WStype_FRAGMENT_FIN:
+      break;
+  }
+}
