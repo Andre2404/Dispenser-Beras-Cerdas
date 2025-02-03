@@ -5,4 +5,5 @@ This prototype is designed to precisely measure rice input using an HX711 load c
 
 Additionally, this technology has potential applications in automated pet feeding systems, allowing remote control and scheduling through ESP32 as the receiver and controller.
 
-![Uploading image.png…]()
+![image](https://github.com/user-attachments/assets/63af28ad-4c32-49d8-a856-1a5abe5feed9)
+
